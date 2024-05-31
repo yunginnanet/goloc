@@ -1,4 +1,4 @@
-package goloc
+package loc
 
 import (
 	"encoding/xml"
@@ -7,6 +7,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -60,7 +61,7 @@ func parseFmtString(rdata []rune, ret *ast.CallExpr) (newData []rune, mapData []
 				// case 'p': // pointer (wtaf)
 				// strconv
 			default:
-				Logger.Fatalf("no way to handle '%s' formatting yet", string(x))
+				Logger.Fatal().Msgf("no way to handle '%s' formatting yet", string(x))
 			}
 			newData = append(newData, []rune("{"+strconv.Itoa(index)+"}")...)
 			index++
@@ -92,28 +93,19 @@ func sep(s string) string {
 	return string(filepath.Separator) + s + string(filepath.Separator)
 }
 
-func contains(ss []string, s string) bool {
-	for _, x := range ss {
-		if s == x {
-			return true
-		}
-	}
-	return false
-}
-
 func (l *Locer) injectTran(name string, ret *ast.CallExpr, f *ast.SelectorExpr, v *ast.BasicLit) (*ast.CallExpr, bool) {
-	data, err := strconv.Unquote(v.Value)
+	stripped, err := strconv.Unquote(v.Value)
 	if err != nil {
-		Logger.Fatal(err)
+		Logger.Fatal().Err(err).Send()
 		return nil, false
 	}
 	needStrConvImport := false
 
-	itemName, isDup := noDupStrings[data]
+	itemName, isDup := noDupStrings[stripped]
 	if !isDup {
 		dataCount[name]++
 		itemName = name + ":" + strconv.Itoa(dataCount[name])
-		noDupStrings[data] = itemName
+		noDupStrings[stripped] = itemName
 		newDataNames[name] = append(newDataNames[name], itemName)
 	}
 
@@ -126,12 +118,12 @@ func (l *Locer) injectTran(name string, ret *ast.CallExpr, f *ast.SelectorExpr, 
 	}
 
 	methToCall := "Trnl"
-	if contains(l.Fmtfuncs, f.Sel.Name) || f.Sel.Name == "Addf" { // is a format call
+	if _, ok := l.Funcs[f.Sel.Name]; ok || f.Sel.Name == "Addf" {
 		methToCall = "Trnlf"
-		dataNew, mapData, needStrconv := parseFmtString([]rune(data), ret)
+		dataNew, mapData, needStrconv := parseFmtString([]rune(stripped), ret)
 		needStrConvImport = needStrconv
 
-		data = string(dataNew)
+		stripped = string(dataNew)
 		args = append(args, &ast.CompositeLit{
 			Type: &ast.MapType{
 				Key: &ast.BasicLit{
@@ -153,14 +145,14 @@ func (l *Locer) injectTran(name string, ret *ast.CallExpr, f *ast.SelectorExpr, 
 				Id:      dataCount[name],
 				Name:    itemName,
 				Value:   "",
-				Comment: data,
+				Comment: stripped,
 			}
 		}
 		// set data only for default value
 		newData[l.DefaultLang][name][itemName] = Value{
 			Id:      dataCount[name],
 			Name:    itemName,
-			Value:   data,
+			Value:   stripped,
 			Comment: itemName,
 		}
 	}
@@ -181,12 +173,7 @@ func stringSlicesEqual(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
 	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
+	return slices.Equal(a, b)
 }
 
 // todo: simplify the newData structure
@@ -232,17 +219,17 @@ func (l *Locer) saveMap(newData map[string]map[string]map[string]Value, newDataN
 					if err != nil {
 						return err
 					}
-					defer f.Close()
+					defer ioClose(f)
 					// set encoding output
 					w = f
 				}
-				w.WriteString(xml.Header)
+				_, _ = w.WriteString(xml.Header)
 				enc := xml.NewEncoder(w)
 				enc.Indent("", "    ")
 				if err := enc.Encode(xmlOutput); err != nil {
 					return err
 				}
-				w.WriteString("\n")
+				_, _ = w.WriteString("\n")
 				return nil
 			}()
 			if err != nil {
@@ -259,15 +246,15 @@ func loadOriginalModuleOrder(modName string) (out []string) {
 		if os.IsNotExist(err) {
 			return
 		}
-		Logger.Fatal(err)
+		Logger.Fatal().Err(err).Send()
 		return
 	}
-	defer f.Close()
+	defer ioClose(f)
 	dec := xml.NewDecoder(f)
 	var xmlData Translation
 	err = dec.Decode(&xmlData)
 	if err != nil {
-		Logger.Fatal(err)
+		Logger.Fatal().Err(err).Send()
 	}
 	for _, row := range xmlData.Rows {
 		out = append(out, row.Name)

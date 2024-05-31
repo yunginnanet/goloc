@@ -5,53 +5,78 @@ import (
 	"go/token"
 	"os"
 
+	"github.com/rs/zerolog"
 	"github.com/spf13/cobra"
-	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
 	"golang.org/x/text/language"
 
-	"github.com/PaulSonOfLars/goloc"
+	"github.com/PaulSonOfLars/goloc/pkg/loc"
 )
 
+func ingestFlagSlices(funcsSlice, fmtfuncsSlice *[]string, l *loc.Locer) {
+	l.Funcs = make(map[string]struct{})
+	l.Fmtfuncs = make(map[string]struct{})
+	for src, dest := range map[*[]string]map[string]struct{}{
+		funcsSlice: l.Funcs, fmtfuncsSlice: l.Fmtfuncs} {
+		if *src == nil {
+			continue
+		}
+		if len(*src) == 0 {
+			continue
+		}
+		for _, f := range *src {
+			dest[f] = struct{}{}
+		}
+	}
+}
+
+func ingestFlagLog(debug, trace bool) {
+	zerolog.SetGlobalLevel(zerolog.InfoLevel)
+	if debug {
+		zerolog.SetGlobalLevel(zerolog.DebugLevel)
+	}
+	if trace {
+		zerolog.SetGlobalLevel(zerolog.TraceLevel)
+	}
+}
+
+func ingestFlagLang(lang string, l *loc.Locer) {
+	if lang == "" {
+		return
+	}
+	l.DefaultLang = lang
+}
+
 func main() {
-	l := &goloc.Locer{
+	l := &loc.Locer{
 		DefaultLang: "en-GB",
 		Checked:     make(map[string]struct{}),
 		Fset:        token.NewFileSet(),
 	}
 
-	var lang string
-	verbose := false
-
-	dyn := zap.NewAtomicLevel() // defaults to Info
-	dyn.SetLevel(zap.InfoLevel)
-
-	cfg := zap.NewProductionEncoderConfig()
-	cfg.EncodeLevel = zapcore.CapitalLevelEncoder
-	cfg.EncodeTime = zapcore.RFC3339TimeEncoder
-
-	logger := zap.New(zapcore.NewCore(zapcore.NewConsoleEncoder(cfg), os.Stdout, dyn))
-	defer logger.Sync() // flushes buffer, if any
-	s := logger.Sugar()
-	goloc.Logger = s
+	var (
+		lang          string
+		debug         = false
+		trace         = false
+		funcsSlice    = make([]string, 0)
+		fmtfuncsSlice = make([]string, 0)
+		log           = loc.Logger
+	)
 
 	rootCmd := cobra.Command{
 		Use:   "goloc",
 		Short: "Extract strings for i18n of your go tools",
 		Long:  "Simple i18n tool to allow for extracting all your i18n strings into manageable files, and load them back after.",
 		PersistentPreRun: func(cmd *cobra.Command, args []string) {
-			if verbose {
-				dyn.SetLevel(zap.DebugLevel)
-			} else {
-				dyn.SetLevel(zap.InfoLevel)
-			}
-			l.DefaultLang = lang
+			ingestFlagLog(debug, trace)
+			ingestFlagLang(lang, l)
+			ingestFlagSlices(&funcsSlice, &fmtfuncsSlice, l)
 		},
 	}
 
-	rootCmd.PersistentFlags().StringSliceVar(&l.Funcs, "funcs", nil, "all funcs to extraxt")
-	rootCmd.PersistentFlags().StringSliceVar(&l.Fmtfuncs, "fmtfuncs", nil, "all format funcs to extract")
-	rootCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "add extra verbosity")
+	rootCmd.PersistentFlags().StringSliceVar(&funcsSlice, "funcs", nil, "all funcs to extraxt")
+	rootCmd.PersistentFlags().StringSliceVar(&fmtfuncsSlice, "fmtfuncs", nil, "all format funcs to extract")
+	rootCmd.PersistentFlags().BoolVarP(&debug, "debug", "v", false, "add extra verbosity")
+	rootCmd.PersistentFlags().BoolVarP(&trace, "trace", "V", false, "add trace verbosity")
 	rootCmd.PersistentFlags().BoolVarP(&l.Apply, "apply", "a", false, "save to file")
 	rootCmd.PersistentFlags().StringVarP(&lang, "lang", "l", language.BritishEnglish.String(), "")
 
@@ -60,7 +85,7 @@ func main() {
 		Short: "Run an analyse all appropriate strings in specified files",
 		Run: func(cmd *cobra.Command, args []string) {
 			if err := l.Handle(args, l.Inspect); err != nil {
-				s.Fatal(err)
+				log.Fatal().Err(err).Send()
 			}
 		},
 	})
@@ -70,7 +95,7 @@ func main() {
 		Short: "extract all strings",
 		Run: func(cmd *cobra.Command, args []string) {
 			if err := l.Handle(args, l.Fix); err != nil {
-				s.Fatal(err)
+				log.Fatal().Err(err).Send()
 			}
 		},
 	})
@@ -81,15 +106,15 @@ func main() {
 		Short: "create new language from default",
 		Run: func(cmd *cobra.Command, args []string) {
 			if createLang == "" {
-				s.Error("No language to create specified")
+				log.Error().Msg("No language to create specified")
 				return
 			}
-			lang := language.Make(createLang)
-			if lang == language.Und {
-				s.Fatalf("invalid language selected: '%s' does not match any known language codes")
+			var langTag language.Tag
+			if langTag = language.Make(createLang); langTag == language.Und {
+				log.Fatal().Msgf("invalid language selected: '%v' does not match any known language codes", lang)
 			}
 
-			l.Create(args, lang)
+			l.Create(args, langTag)
 		},
 	}
 	createCmd.Flags().StringVarP(&createLang, "create", "c", "", "select which language to create")
@@ -110,7 +135,7 @@ func main() {
 				err = l.Check(checkLang)
 			}
 			if err != nil {
-				s.Fatal(err)
+				log.Fatal().Err(err).Send()
 			}
 		},
 	}

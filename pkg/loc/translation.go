@@ -1,23 +1,25 @@
-package goloc
+package loc
 
 import (
 	"encoding/xml"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
 	"sort"
 	"strings"
 
-	"go.uber.org/zap"
+	"github.com/rs/zerolog"
 )
 
-var data = make(map[string]map[string]Value)
-var dataCount = make(map[string]int)
-var languages []string
-var DefaultLang = "en-GB"
-var Logger *zap.SugaredLogger
+var (
+	data        = make(map[string]map[string]Value)
+	dataCount   = make(map[string]int)
+	languages   []string
+	DefaultLang = "en-US"
+	Logger      *zerolog.Logger
+)
 
 func Trnl(lang string, trnlVal string) string {
 	v, ok := data[lang][trnlVal]
@@ -41,12 +43,12 @@ func Trnlf(lang string, trnlVal string, dataMap map[string]string) string {
 }
 
 func Add(text string) string {
-	Logger.Warn("unloaded translation string for Add()")
+	Logger.Warn().Msg("unloaded translation string for Add()")
 	return text
 }
 
 func Addf(text string, format ...interface{}) string {
-	Logger.Warn("unloaded translation string for Addf()")
+	Logger.Warn().Msg("unloaded translation string for Addf()")
 	return fmt.Sprintf(text, format...)
 }
 
@@ -62,13 +64,13 @@ func LoadAll(defLang string) {
 			}
 			relPath, err := filepath.Rel(base, fpath)
 			if err != nil {
-				Logger.With(zap.Error(err)).Errorf("Could not get relative path of %s", fpath)
+				Logger.Error().Err(err).Msgf("Could not get relative path of %s", fpath)
 			}
 			Load(relPath)
 			return nil
 		})
 	if err != nil {
-		Logger.With(zap.Error(err)).Errorf("Failed to walk translations directory %s", base)
+		Logger.Error().Err(err).Msgf("Failed to walk translations directory %s", base)
 	}
 }
 
@@ -84,14 +86,20 @@ func LoadLangAll(lang string) {
 			}
 			relPath, err := filepath.Rel(base, fpath)
 			if err != nil {
-				Logger.With(zap.Error(err)).Errorf("Could not get relative path of %s", fpath)
+				Logger.Error().Err(err).Msgf("Could not get relative path of %s", fpath)
 			}
 			LoadLangModule(lang, relPath)
 			// Load(info.Name())
 			return nil
 		})
 	if err != nil {
-		Logger.With(zap.Error(err)).Errorf("Failed to walk translations directory %s", base)
+		Logger.Error().Err(err).Msgf("Failed to walk translations directory %s", base)
+	}
+}
+
+func ioClose(f io.Closer) {
+	if err := f.Close(); err != nil {
+		panic(err)
 	}
 }
 
@@ -101,15 +109,15 @@ func LoadLangModule(lang string, moduleName string) {
 		if os.IsNotExist(err) {
 			return
 		}
-		Logger.With(zap.Error(err)).Errorf("Failed to open file at %s", moduleName)
+		Logger.Error().Err(err).Msgf("Failed to open file at %s", moduleName)
 		return
 	}
-	defer f.Close()
+	defer ioClose(f)
 	dec := xml.NewDecoder(f)
 	var xmlData Translation
 	err = dec.Decode(&xmlData)
 	if err != nil {
-		Logger.With(zap.Error(err)).Errorf("Failed to decode data for %s", moduleName)
+		Logger.Error().Err(err).Msgf("Failed to decode data for %s", moduleName)
 		return
 	}
 	for _, row := range xmlData.Rows {
@@ -131,13 +139,13 @@ func LoadLangModule(lang string, moduleName string) {
 }
 
 func Load(moduleToLoad string) {
-	files, err := ioutil.ReadDir(translationDir)
+	files, err := os.ReadDir(translationDir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return
 		}
 
-		Logger.With(zap.Error(err)).Errorf("failed to load %s", moduleToLoad)
+		Logger.Error().Err(err).Msgf("failed to load %s", moduleToLoad)
 		return
 	}
 	for _, x := range files {

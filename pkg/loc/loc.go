@@ -1,4 +1,4 @@
-package goloc
+package loc
 
 import (
 	"bytes"
@@ -16,13 +16,18 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
+	"git.tcp.direct/kayos/common/pool"
 	"github.com/BlackEspresso/htmlcheck"
+	"github.com/rs/zerolog"
 	"golang.org/x/text/language"
 	"golang.org/x/tools/go/ast/astutil"
 )
 
 const translationDir = "trans"
+
+var bufs = pool.NewBufferFactory()
 
 type Translation struct {
 	XMLName xml.Name `xml:"translation"`
@@ -39,17 +44,18 @@ type Value struct {
 
 type Locer struct {
 	DefaultLang string
-	Funcs       []string
-	Fmtfuncs    []string
+	Funcs       map[string]struct{}
+	Fmtfuncs    map[string]struct{}
 	Checked     map[string]struct{}
 	OrderedVals []string
 	Fset        *token.FileSet
 	Apply       bool
+	Counter     int64
 }
 
 func (l *Locer) Handle(args []string, hdnl func(*ast.File)) error {
 	if len(args) == 0 {
-		Logger.Error("No input provided.")
+		Logger.Error().Msg("No input provided.")
 		return nil
 	}
 	for _, arg := range args {
@@ -61,8 +67,9 @@ func (l *Locer) Handle(args []string, hdnl func(*ast.File)) error {
 		switch mode := fi.Mode(); {
 		case mode.IsDir():
 			// do directory stuff
-			Logger.Debug("directory input")
-			nodes, err := parser.ParseDir(l.Fset, arg, nil, parser.ParseComments)
+			Logger.Debug().Msg("directory input")
+			var nodes map[string]*ast.Package
+			nodes, err = parser.ParseDir(l.Fset, arg, nil, parser.ParseComments)
 			if err != nil {
 				return err
 			}
@@ -78,7 +85,7 @@ func (l *Locer) Handle(args []string, hdnl func(*ast.File)) error {
 			}
 		case mode.IsRegular():
 			// do file stuff
-			Logger.Debug("file input")
+			Logger.Debug().Msg("file input")
 			node, err := parser.ParseFile(l.Fset, arg, nil, parser.ParseComments)
 			if err != nil {
 				return err
@@ -91,55 +98,216 @@ func (l *Locer) Handle(args []string, hdnl func(*ast.File)) error {
 			hdnl(node)
 		}
 	}
-	Logger.Info("the following have been checked:")
+	Logger.Info().Msg("the following have been checked:")
 	for k := range l.Checked {
-		Logger.Info("  " + k)
+		Logger.Info().Msg("  " + k)
 	}
 	return nil
 }
 
 // TODO: remove dup code with the fix() method
-func (l *Locer) Inspect(node *ast.File) {
-	var counter int
-	// var inMeth *ast.FuncDecl
-	ast.Inspect(node, func(n ast.Node) bool {
-		// if ret, ok := n.(*ast.FuncDecl); ok {
-		//	inMeth = ret
+
+func (l *Locer) functionSublogger(x *ast.FuncDecl) zerolog.Logger {
+	slog := *Logger
+	slog = slog.With().
+		Str("caller", x.Name.Name).
+		Int("position", int(x.Pos())).
+		Str("type", "function").
+		Logger()
+
+	if x.Doc.Text() != "" {
+		slog = slog.With().Str("doc", x.Doc.Text()).Logger()
+	}
+	if x.Type.TypeParams != nil && len(x.Type.TypeParams.List) > 0 {
+		slog = slog.With().Interface("type_parameters", x.Type.TypeParams).Logger()
+	}
+	if x.Type.Params != nil && len(x.Type.Params.List) > 0 {
+		parameters := make(map[int]string)
+		for _, p := range x.Type.Params.List {
+			parameters[int(p.Pos())] = p.Type.(*ast.Ident).Name
+		}
+		slog = slog.With().Interface("parameters", parameters).Logger()
+	}
+	if x.Type.Results != nil && len(x.Type.Results.List) > 0 {
+		results := make(map[int]string)
+		for _, r := range x.Type.Results.List {
+			results[int(r.Pos())] = r.Type.(*ast.Ident).Name
+		}
+		slog = slog.With().Interface("results", results).Logger()
+	}
+	return slog
+}
+
+func (l *Locer) Visit(n ast.Node) ast.Visitor {
+	if n == nil {
+		return nil
+	}
+
+	if !n.Pos().IsValid() || !n.End().IsValid() {
+		Logger.Warn().
+			Interface("node", n).
+			Int("pos", int(n.Pos())).
+			Msg("invalid position")
+
+		return nil
+	}
+
+	switch x := n.(type) {
+	case *ast.Comment:
+		if x.Text == "" {
+			Logger.Trace().Msg("empty comment")
+			return l
+		}
+		return l.HandleComment(x)
+
+	case *ast.CommentGroup:
+		for _, c := range x.List {
+			l.HandleComment(c)
+		}
+	case *ast.FuncDecl:
+		slog := l.functionSublogger(x)
+		_, funcOK := l.Funcs[x.Name.Name]
+		_, fmtOK := l.Fmtfuncs[x.Name.Name]
+		if funcOK || fmtOK {
+			slog.Debug().Msg("found a function in our list")
+			return l
+		}
+		slog.Debug().Msg("found a function")
+	case *ast.BasicLit:
+		return l.HandleLiteral(x)
+	default:
+		Logger.Trace().Interface("node", x).Msg("unhandled node")
+	}
+
+	return l
+}
+
+func (l *Locer) HandleComment(x *ast.Comment) ast.Visitor {
+	slog := *Logger
+
+	slog = slog.With().
+		Str("type", "comment").
+		Str("text", x.Text).
+		Logger()
+
+	slog.Trace().Msg("found a comment")
+
+	return l
+}
+
+func (l *Locer) HandleLiteral(x *ast.BasicLit) ast.Visitor {
+	slog := *Logger
+
+	slog = slog.With().
+		Str("type", "literal").
+		Interface("value", x.Value).
+		Str("kind", x.Kind.String()).
+		Logger()
+
+	slog.Trace().Msg("found a literal")
+
+	switch {
+	case x.Kind.IsOperator():
+		slog.Debug().Msg("ignoring operator during literal inspection")
+		return l
+	case x.Kind.IsKeyword():
+		slog.Debug().Msg("ignoring keyword during literal inspection")
+		return l
+	case x.Kind.Precedence() > token.LowestPrec:
+		slog.Debug().Msg("ignoring binary op during literal inspection")
+		return l
+	case x.Kind != token.STRING:
+		slog.Debug().Msg("ignoring non-string during literal inspection")
+		return l
+	case x.Kind == token.STRING:
 		//
-		// } else
-		if ret, ok := n.(*ast.CallExpr); ok {
-			Logger.Debug("\n found a call ")
-			// printer.Fprint(os.Stdout, fset, ret)
-			if f, ok := ret.Fun.(*ast.SelectorExpr); ok {
-				Logger.Debug("\n  found call named " + f.Sel.Name)
-				if contains(append(l.Funcs, l.Fmtfuncs...), f.Sel.Name) && len(ret.Args) > 0 {
-					ex := ret.Args[0]
+	default:
+		slog.Warn().Msg("unhandled literal")
+		return l
+	}
 
-					if v, ok := ex.(*ast.BasicLit); ok && v.Kind == token.STRING {
-						buf := bytes.NewBuffer([]byte{})
-						printer.Fprint(buf, l.Fset, v)
-						Logger.Debugf("\n   found a string:\n%s", buf.String())
+	return l.HandleString(x)
+}
 
-						counter++
-						name := l.Fset.File(v.Pos()).Name() + ":" + strconv.Itoa(counter)
-						l.OrderedVals = append(l.OrderedVals, name)
+func (l *Locer) HandleString(x *ast.BasicLit) ast.Visitor {
+	slog := *Logger
 
-					} else if v2, ok := ex.(*ast.BinaryExpr); ok && v2.Op == token.ADD {
-						// note: plz reformat not to use adds
-						Logger.Debug("\n   found a binary expr instead of str; fix your code")
-						// v, ok := v2.X.(*ast.BasicLit)
-						// v, ok := v2.Y.(*ast.BasicLit)
+	slog = slog.With().
+		Str("type", "string").
+		// Interface("value", x.Value).
+		Logger()
 
-					} else {
-						Logger.Debugf("\n   found something else: %T", ex)
+	slog.Trace().Msg("processing string literal")
 
+	buf := bufs.Get()
+
+	if err := printer.Fprint(buf, l.Fset, x); err != nil {
+		bufs.MustPut(buf)
+		slog.Fatal().Err(err).Send()
+		return nil // unreachable
+	}
+
+	if strings.TrimSpace(buf.String()) == "" {
+		slog.Debug().Msg("ignoring empty string")
+		bufs.MustPut(buf)
+		return l
+	}
+
+	slog.Info().Msgf("found: %s", buf.String())
+
+	bufs.MustPut(buf)
+
+	atomic.AddInt64(&l.Counter, 1)
+	name := l.Fset.File(x.Pos()).Name() + ":" + strconv.Itoa(int(atomic.LoadInt64(&l.Counter)))
+	l.OrderedVals = append(l.OrderedVals, name)
+
+	return l
+}
+
+func (l *Locer) Inspect(node *ast.File) {
+	// var inMeth *ast.FuncDecl
+	ast.Walk(l, node)
+
+	/*if ret, ok := n.(*ast.CallExpr); ok {
+		slog = slog.With().Str("type", "call").Logger()
+		slog.Trace().Msg("found a call")
+		// printer.Fprint(os.Stdout, fset, ret)
+		if fnc, fncOK := ret.Fun.(*ast.SelectorExpr); fncOK {
+			if fnc.Sel != nil && fnc.Sel.Name != "" {
+				slog = slog.With().
+					Str("caller", fnc.Sel.Name).
+					Int("position", int(fnc.Sel.Pos())).
+					Logger()
+			}
+			slog.Debug().Msg("found a selector")
+			if contains(append(l.Funcs, l.Fmtfuncs...), fnc.Sel.Name) && len(ret.Args) > 0 {
+				for _, ex := range ret.Args {
+				if v, bLitOK := ex.(*ast.BasicLit); bLitOK && v.Kind == token.STRING {
+					buf := bufs.Get()
+					if err := printer.Fprint(buf, l.Fset, v); err != nil {
+						slog.Fatal().Err(err).Send()
 					}
+					slog.Debug().Msgf("found string: %s", buf.String())
+					bufs.MustPut(buf)
+
+					counter++
+					name := l.Fset.File(v.Pos()).Name() + ":" + strconv.Itoa(counter)
+					l.OrderedVals = append(l.OrderedVals, name)
+
+				} else if v2, binOK := ex.(*ast.BinaryExpr); binOK && v2.Op == token.ADD {
+					// note: plz reformat not to use adds
+					slog.Debug().Msg("found a binary expr instead of str; fix your code")
+					// v, ok := v2.X.(*ast.BasicLit)
+					// v, ok := v2.Y.(*ast.BasicLit)
+
+				} else {
+					slog.Debug().Msgf("found something else: %T", ex)
+				}
 				}
 			}
 		}
-		return true
-	})
-	Logger.Debug()
+	}*/
+
 }
 
 var newData map[string]map[string]map[string]Value // locale:(filename:(trigger:Value))
@@ -147,6 +315,7 @@ var newDataNames map[string][]string               // filename:[]newtriggers
 var noDupStrings map[string]string                 // map of currently loaded strings, to avoid duplicates and reduce translation efforts
 
 // todo: ensure import works as expected
+
 func (l *Locer) Fix(node *ast.File) {
 	name := l.Fset.File(node.Pos()).Name()
 	loadModuleExpr := &ast.ExprStmt{
@@ -167,7 +336,7 @@ func (l *Locer) Fix(node *ast.File) {
 	// todo: investigate unnecessary "lang := " loads
 
 	Load(name) // load current values
-	Logger.Debug("module count at", dataCount[name])
+	Logger.Debug().Msgf("module count at %d", dataCount[name])
 	newData = make(map[string]map[string]map[string]Value) // locale:(filename:(trigger:Value))
 	newDataNames = make(map[string][]string)               // filename:[]newtriggers
 	noDupStrings = make(map[string]string)                 // map of currently loaded strings, to avoid duplicates and reduce translation efforts
@@ -201,16 +370,20 @@ func (l *Locer) Fix(node *ast.File) {
 			} else if callExpr, ok := n.(*ast.CallExpr); ok {
 				// determine if method is one of the validated ones
 				if funcCall, ok := callExpr.Fun.(*ast.SelectorExpr); ok {
-					Logger.Debug("\n  found random call named " + funcCall.Sel.Name)
+					Logger.Debug().Msg("found random call named " + funcCall.Sel.Name)
 
 					// if valid and has args, check first arg (which should be a string)
-					if contains(append(l.Funcs, l.Fmtfuncs...), funcCall.Sel.Name) && len(callExpr.Args) > 0 {
+					_, funcOK := l.Funcs[funcCall.Sel.Name]
+					_, fmtOK := l.Fmtfuncs[funcCall.Sel.Name]
+					if funcOK || fmtOK && len(callExpr.Args) > 0 {
 						firstArg := callExpr.Args[0]
 
 						if litItem, ok := firstArg.(*ast.BasicLit); ok && litItem.Kind == token.STRING {
 							buf := bytes.NewBuffer([]byte{})
-							printer.Fprint(buf, l.Fset, litItem)
-							Logger.Debugf("\n   found a string in funcname %s:\n%s", funcCall.Sel.Name, buf.String())
+							if err := printer.Fprint(buf, l.Fset, litItem); err != nil {
+								Logger.Fatal().Err(err).Send()
+							}
+							Logger.Debug().Msgf("found a string in funcname %s:\n%s", funcCall.Sel.Name, buf.String())
 
 							args, needStrconvImportNew := l.injectTran(name, callExpr, funcCall, litItem)
 
@@ -226,10 +399,10 @@ func (l *Locer) Fix(node *ast.File) {
 							// if not a string, but a binop:
 						} else if binExpr, ok := firstArg.(*ast.BinaryExpr); ok && binExpr.Op == token.ADD {
 							// note: plz reformat not to use adds
-							Logger.Debug("\n   found a binary expr instead of str; fix your code")
+							Logger.Debug().Msg("found a binary expr instead of str; fix your code")
 
 						} else {
-							Logger.Debugf("\n   found something else: %T", firstArg)
+							Logger.Debug().Msgf("found something else: %T", firstArg)
 						}
 					} else if caller, ok := funcCall.X.(*ast.Ident); ok && caller.Name == "goloc" {
 						// has already been translated, check if it isn't duplicated.
@@ -237,7 +410,7 @@ func (l *Locer) Fix(node *ast.File) {
 							if arg, ok := callExpr.Args[1].(*ast.BasicLit); ok && arg.Kind == token.STRING { // possible OOB
 								val, err := strconv.Unquote(arg.Value)
 								if err != nil {
-									Logger.Fatal(err)
+									Logger.Fatal().Err(err).Send()
 									return true
 								}
 								itemName, ok := noDupStrings[data[l.DefaultLang][val].Value]
@@ -270,7 +443,7 @@ func (l *Locer) Fix(node *ast.File) {
 							if v, ok := callExpr.Args[0].(*ast.BasicLit); ok {
 								buf := bytes.NewBuffer([]byte{})
 								printer.Fprint(buf, l.Fset, v)
-								Logger.Debugf("\n   found a string to add via Add(f):\n%s", buf.String())
+								Logger.Debug().Msgf("found a string to add via Add(f):\n%s", buf.String())
 
 								callExpr, needStrconvImport = l.injectTran(name, callExpr, funcCall, v)
 
@@ -305,7 +478,7 @@ func (l *Locer) Fix(node *ast.File) {
 					}
 				}
 
-				Logger.Debug("adding lang to " + name)
+				Logger.Debug().Msg("adding lang to " + name)
 				FuncDecl.Body.List = append([]ast.Stmt{
 					&ast.AssignStmt{
 						Lhs: []ast.Expr{&ast.Ident{Name: "lang"}},
@@ -360,7 +533,7 @@ func (l *Locer) Fix(node *ast.File) {
 	if l.Apply {
 		f, err := os.Create(name)
 		if err != nil {
-			Logger.Fatal(err)
+			Logger.Fatal().Err(err).Send()
 			return
 		}
 		defer f.Close()
@@ -369,11 +542,11 @@ func (l *Locer) Fix(node *ast.File) {
 
 	}
 	if err := format.Node(out, l.Fset, node); err != nil {
-		Logger.Fatal(err)
+		Logger.Fatal().Err(err).Send()
 		return
 	}
 	if err := l.saveMap(newData, newDataNames); err != nil {
-		Logger.Fatal(err)
+		Logger.Fatal().Err(err).Send()
 		return
 	}
 }
@@ -426,7 +599,7 @@ func (l *Locer) Create(args []string, lang language.Tag) {
 			return nil
 		})
 	if err != nil {
-		Logger.Fatal(err)
+		Logger.Fatal().Err(err).Send()
 	}
 }
 
@@ -480,13 +653,13 @@ func (l *Locer) check(v htmlcheck.Validator, lang string) error {
 
 	for s, d := range data[lang] {
 		if s != d.Name {
-			Logger.Errorf("%s: '%s'\tfatally incorrect", lang, s)
+			Logger.Error().Msgf("%s: '%s'\tfatally incorrect", lang, s)
 			continue
 		}
 		defLangVal := data[l.DefaultLang][s]
 
 		if defLangVal.Id != d.Id {
-			Logger.Errorf("%s: '%s'\thas different ids from default language %s", lang, s, l.DefaultLang)
+			Logger.Error().Msgf("%s: '%s'\thas different ids from default language %s", lang, s, l.DefaultLang)
 			continue
 		}
 
@@ -496,17 +669,17 @@ func (l *Locer) check(v htmlcheck.Validator, lang string) error {
 		}
 
 		if err := checkCurlies(defLangVal.Value, d.Value); err != nil {
-			Logger.Errorf("%s: '%s'\tcurlies mismatch: %s", lang, s, err.Error())
+			Logger.Error().Msgf("%s: '%s'\tcurlies mismatch: %s", lang, s, err.Error())
 
 		}
 		if err := checkValidHTML(v, defLangVal.Value, d.Value); err != nil {
-			Logger.Errorf("%s: '%s'\tHTML error: %s", lang, s, err.Error())
+			Logger.Error().Msgf("%s: '%s'\tHTML error: %s", lang, s, err.Error())
 		}
-		//if err := checkWS(defLangVal.Value, d.Value); err != nil {
-		//	Logger.Errorf("%s: '%s'\twhitespace error: %s", lang, s, err.Error())
-		//}
+		// if err := checkWS(defLangVal.Value, d.Value); err != nil {
+		//	Logger.Error().Msgf("%s: '%s'\twhitespace error: %s", lang, s, err.Error())
+		// }
 		if err := checkForSymbols(defLangVal.Value, d.Value); err != nil {
-			Logger.Errorf("%s: '%s'\tsymbols error: %s", lang, s, err.Error())
+			Logger.Error().Msgf("%s: '%s'\tsymbols error: %s", lang, s, err.Error())
 		}
 	}
 	// TODO: investigate changing decoder
@@ -619,11 +792,9 @@ func (l *Locer) getUnFmtFunc(name string) string {
 		// not a formatting function; all ok.
 		return name
 	}
-	for _, f := range l.Funcs {
-		if f+"f" == name {
-			// found simple func; return.
-			return f
-		}
+	if _, ok := l.Fmtfuncs[name[:len(name)-1]]; ok {
+		// found simple func; return.
+		return name[:len(name)-1]
 	}
 	// no result found; return current.
 	return name
