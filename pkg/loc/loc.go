@@ -124,14 +124,18 @@ func (l *Locer) functionSublogger(x *ast.FuncDecl) zerolog.Logger {
 	if x.Type.Params != nil && len(x.Type.Params.List) > 0 {
 		parameters := make(map[int]string)
 		for _, p := range x.Type.Params.List {
-			parameters[int(p.Pos())] = p.Type.(*ast.Ident).Name
+			if idnt, ok := p.Type.(*ast.Ident); ok {
+				parameters[int(p.Pos())] = idnt.Name
+			}
 		}
 		slog = slog.With().Interface("parameters", parameters).Logger()
 	}
 	if x.Type.Results != nil && len(x.Type.Results.List) > 0 {
 		results := make(map[int]string)
 		for _, r := range x.Type.Results.List {
-			results[int(r.Pos())] = r.Type.(*ast.Ident).Name
+			if idnt, ok := r.Type.(*ast.Ident); ok {
+				results[int(r.Pos())] = idnt.Name
+			}
 		}
 		slog = slog.With().Interface("results", results).Logger()
 	}

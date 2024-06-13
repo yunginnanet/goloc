@@ -11,3 +11,5 @@ Rewrite for the modern era in progress;
   - attempt to modernize usage of `go/ast` package
   - swap zap logger for zerolog
   - turn test into a proper golang unit test
+  - restructure directories
+  - add `Makefile`
